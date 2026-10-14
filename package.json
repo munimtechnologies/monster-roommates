@@ -1,0 +1,15 @@
+{
+  "name": "monster-roommates",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Monster Roommates: the RUN build (index.html plus RUN's SDK). By MV2 of Munim, Inc., made with AI agents.",
+  "license": "Apache-2.0",
+  "scripts": {
+    "build:run": "node build_run.mjs run-dist"
+  },
+  "devDependencies": {
+    "@series-inc/rundot-game-sdk": "5.29.1",
+    "esbuild": "0.24.0"
+  }
+}

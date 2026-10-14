@@ -1,0 +1,852 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Monster Roommates</title>
+<!-- Monster Roommates v0.1.0 (Apache-2.0), by MV2 of Munim, Inc., made with AI agents. Built on html-jam-kit: one self-contained HTML file.
+     On RUN, the RUN build loads RUN's SDK first (window.RundotGameAPI) for saves, sharing, a daily leaderboard, an optional rewarded ad and a daily reminder; anywhere else the game runs on its own. -->
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:#161230;touch-action:none;user-select:none;-webkit-user-select:none}
+canvas{display:block;position:absolute}
+body.demo canvas{cursor:none}
+#test,#covers{position:absolute;inset:16px;overflow:auto;background:#101820f2;color:#e8eef4;border-radius:10px;padding:14px;z-index:3;white-space:pre-wrap;font:13px/1.4 ui-monospace,Consolas,monospace}
+#covers img{display:block;max-width:100%;margin:8px 0 18px;border:1px solid #ffffff33}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="test" hidden></div>
+<div id="covers" hidden></div>
+
+<script id="logic">
+"use strict";
+// Monster Roommates rules: no DOM, no canvas, no audio, so the tests can run this block under Node.
+// A house is a grid of rooms: row 0 is the attic, the last row the cellar, and some rooms have a moonlit
+// pane (win[p]). Each house has monster tenants and house rules, and exactly one way to move everyone in
+// keeps every rule: the generator only keeps a house once its solver has proved that.
+const W=720,H=1280;                 // logical size, portrait; wider screens are letterboxed
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+const clamp=(x,a,b)=>Math.max(a,Math.min(b,x));
+function shuffle(a,r){for(let k=a.length-1;k>0;k--){const j=Math.floor(r()*(k+1));[a[k],a[j]]=[a[j],a[k]];}return a;}
+
+// the cast: five live on the street from the start, and a new tenant moves in every third house.
+// avoid: rules a tenant never gets (a vampire is never asked to sit in the moonlight)
+const CAST=[
+ {id:"ghost",name:"Boo",kind:"ghost",icon:"👻",bio:"Floats through walls. Terrible at hide and seek.",avoid:[]},
+ {id:"vampire",name:"Nibbles",kind:"vampire",icon:"🧛",bio:"Sleeps all day and sings opera all night.",avoid:["win"]},
+ {id:"zombie",name:"Shuffles",kind:"zombie",icon:"🧟",bio:"Slow to wake up. Even slower at the dishes.",avoid:[]},
+ {id:"werewolf",name:"Howler",kind:"werewolf",icon:"🐺",bio:"Perfectly polite until the moon comes out.",avoid:["nowin"]},
+ {id:"bat",name:"Flit",kind:"bat",icon:"🦇",bio:"Hangs upside down and drops snacks on you.",avoid:[]},
+ {id:"spider",name:"Webby",kind:"spider",icon:"🕷️",bio:"Knits curtains that nobody asked for.",avoid:[]},
+ {id:"pumpkin",name:"Jack",kind:"pumpkin head",icon:"🎃",bio:"Glows when happy. Glows a lot.",avoid:[]},
+ {id:"skeleton",name:"Rattles",kind:"skeleton",icon:"💀",bio:"Plays the xylophone on its own ribs.",avoid:[]},
+ {id:"witch",name:"Hazel",kind:"witch",icon:"🧙",bio:"Brews soup. Sometimes the soup brews back.",avoid:[]},
+ {id:"kraken",name:"Inky",kind:"kraken",icon:"🐙",bio:"Lives in the bathtub. Hogs the bathtub.",avoid:[]}
+];
+const UNARY=["win","nowin","top","bottom","alone","company"],BINARY=["next","notNext","higher","sameFloor","leftOf"];
+const KIND_ORDER=UNARY.concat(BINARY);
+const K1=["win","nowin","top","bottom"],K2=K1.concat(["next","notNext"]),K3=K2.concat(["alone","company"]),
+  K4=K3.concat(["higher","sameFloor"]),K_ALL=K4.concat(["leftOf"]);
+// houses from `from` on: size, number of tenants, the rules they can have, and the line that teaches what is new
+const STAGES=[
+ {from:1,cols:2,rows:2,n:3,kinds:K1,teach:"Tap a monster, then a room. Make every rule green."},
+ {from:3,cols:3,rows:2,n:4,kinds:K2,teach:"New rule: “next to” means the rooms share a wall."},
+ {from:6,cols:3,rows:2,n:5,kinds:K3,teach:"New rule: “no neighbours” means nobody shares a wall."},
+ {from:10,cols:3,rows:3,n:6,kinds:K4,teach:"New rule: “upstairs of” means on any higher floor."},
+ {from:15,cols:3,rows:3,n:7,kinds:K_ALL,teach:"New rule: “left of” means further left, any floor."},
+ {from:25,cols:4,rows:3,n:8,kinds:K_ALL,teach:"A bigger house: twelve rooms, eight tenants!"}
+];
+const DAILY={cols:3,rows:3,n:7,kinds:K_ALL};
+const MAX_RULES=14,BUDGET=60000;
+
+const rowOf=(h,p)=>Math.floor(p/h.cols),colOf=(h,p)=>p%h.cols;
+function adjacent(h,p,q){const dr=Math.abs(rowOf(h,p)-rowOf(h,q)),dc=Math.abs(colOf(h,p)-colOf(h,q));return dr+dc===1;}
+// "ok", "bad" or "wait" (not decided yet) for a rule, with pos[a] the room of tenant a or -1 when not moved in
+function ruleStatus(h,r,pos){
+  const p=pos[r.a];
+  if(p==null||p<0)return "wait";
+  const ra=rowOf(h,p),ca=colOf(h,p);
+  if(r.k==="win")return h.win[p]?"ok":"bad";
+  if(r.k==="nowin")return h.win[p]?"bad":"ok";
+  if(r.k==="top")return ra===0?"ok":"bad";
+  if(r.k==="bottom")return ra===h.rows-1?"ok":"bad";
+  if(r.k==="alone"||r.k==="company"){
+    let near=false;
+    for(let o=0;o<pos.length;o++)if(o!==r.a&&pos[o]>=0&&adjacent(h,p,pos[o]))near=true;
+    if(r.k==="alone")return near?"bad":"ok";
+    return near?"ok":pos.every(x=>x>=0)?"bad":"wait";
+  }
+  const q=pos[r.b];
+  if(q==null||q<0)return "wait";
+  const rb=rowOf(h,q),cb=colOf(h,q);
+  if(r.k==="next")return adjacent(h,p,q)?"ok":"bad";
+  if(r.k==="notNext")return adjacent(h,p,q)?"bad":"ok";
+  if(r.k==="higher")return ra<rb?"ok":"bad";
+  if(r.k==="sameFloor")return ra===rb?"ok":"bad";
+  if(r.k==="leftOf")return ca<cb?"ok":"bad";
+  return "bad";
+}
+function ruleText(r,ms){
+  const A=CAST[ms[r.a]].icon,B=r.b==null?"":CAST[ms[r.b]].icon;
+  return {win:A+" needs moonlight",nowin:A+" no moonlight!",top:A+" lives in the attic",bottom:A+" lives in the cellar",
+    alone:A+" no neighbours",company:A+" needs a neighbour",next:A+" next to "+B,notNext:A+" not next to "+B,
+    higher:A+" upstairs of "+B,sameFloor:A+" same floor as "+B,leftOf:A+" left of "+B}[r.k];
+}
+
+// counts the ways to move every tenant in (stops at `limit`); done is false when it gave up after `budget` rooms tried
+function countSolutions(h,rules,limit,budget){
+  const n=h.n,R=h.cols*h.rows,pos=new Array(n).fill(-1),used=new Array(R).fill(false);
+  const dom=[];
+  for(let a=0;a<n;a++){
+    const own=rules.filter(r=>r.a===a&&K1.includes(r.k)),d=[];
+    for(let p=0;p<R;p++){const tp=new Array(n).fill(-1);tp[a]=p;if(own.every(r=>ruleStatus(h,r,tp)==="ok"))d.push(p);}
+    dom.push(d);
+  }
+  const order=[...Array(n).keys()].sort((x,y)=>dom[x].length-dom[y].length||x-y);
+  const rel=[...Array(n).keys()].map(a=>rules.filter(r=>r.a===a||r.b===a||r.k==="alone"));
+  let count=0,nodes=0;
+  function rec(k){
+    if(count>=limit||nodes>budget)return;
+    if(k===n){if(rules.every(r=>ruleStatus(h,r,pos)==="ok"))count++;return;}
+    const a=order[k];
+    for(const p of dom[a]){
+      if(used[p])continue;
+      nodes++;
+      pos[a]=p;used[p]=true;
+      if(rel[a].every(r=>ruleStatus(h,r,pos)!=="bad"))rec(k+1);
+      pos[a]=-1;used[p]=false;
+      if(count>=limit||nodes>budget)return;
+    }
+  }
+  rec(0);
+  return {count,nodes,done:nodes<=budget};
+}
+function ruleOrder(x,y){
+  const ux=x.b==null?0:1,uy=y.b==null?0:1;
+  if(ux!==uy)return ux-uy;
+  if(x.a!==y.a)return x.a-y.a;
+  if((x.b|0)!==(y.b|0))return (x.b|0)-(y.b|0);
+  return KIND_ORDER.indexOf(x.k)-KIND_ORDER.indexOf(y.k);
+}
+// a house from a seed: random rooms, tenants and an answer; then rules true of that answer are added until the
+// answer is the only one, and every rule that is not needed is taken out again
+function makeHouse(seed,spec,pool,must){
+  for(let attempt=0;attempt<48;attempt++){
+    const r=mulberry32((seed^Math.imul(attempt+1,0x9E3779B1))>>>0);
+    const kinds=attempt<32?spec.kinds:K_ALL,R=spec.cols*spec.rows,n=spec.n;
+    const win=[];for(let p=0;p<R;p++)win.push(r()<0.45);
+    const others=shuffle(pool.filter(id=>id!==must),r);
+    const ms=shuffle((must==null?[]:[must]).concat(others).slice(0,n),r);
+    const sol=shuffle([...Array(R).keys()],r).slice(0,n);
+    const h={cols:spec.cols,rows:spec.rows,n,win,ms};
+    const cand=[];
+    for(let a=0;a<n;a++)for(const k of UNARY){
+      if(!kinds.includes(k)||CAST[ms[a]].avoid.includes(k))continue;
+      const c={k,a};if(ruleStatus(h,c,sol)==="ok")cand.push(c);
+    }
+    for(let a=0;a<n;a++)for(let b=0;b<n;b++){
+      if(a===b)continue;
+      for(const k of BINARY){
+        if(!kinds.includes(k)||((k==="next"||k==="notNext"||k==="sameFloor")&&b<a))continue;
+        const c={k,a,b};if(ruleStatus(h,c,sol)==="ok")cand.push(c);
+      }
+    }
+    shuffle(cand,r);
+    let rules=[],unique=false;
+    for(const c of cand){
+      rules.push(c);
+      const s=countSolutions(h,rules,2,BUDGET);
+      if(s.done&&s.count===1){unique=true;break;}
+    }
+    if(!unique)continue;
+    for(let q=rules.length-1;q>=0;q--){
+      const t=rules.slice(0,q).concat(rules.slice(q+1)),s=countSolutions(h,t,2,BUDGET);
+      if(s.done&&s.count===1)rules=t;
+    }
+    if(rules.length>MAX_RULES)continue;
+    rules.sort(ruleOrder);
+    return {cols:spec.cols,rows:spec.rows,n,win,ms,rules,sol,attempt};
+  }
+  return null;
+}
+
+function levelSpec(L){let s=STAGES[0];for(const st of STAGES)if(L>=st.from)s=st;return s;}
+function castFor(L){return Math.min(CAST.length,5+Math.floor((L-1)/3));}
+// the tenant who moves in on house L (shown once, and always in that house), or null
+function newTenant(L){return L>1&&castFor(L)>castFor(L-1)?castFor(L)-1:null;}
+function teachFor(L){const s=levelSpec(L);return L===s.from||(s.from===1&&L===2)?s.teach:"";}
+function dailySeed(d){let h=2166136261;for(const ch of String(d))h=Math.imul(h^ch.charCodeAt(0),16777619);return h>>>0;}
+// a house is named by a key: "L7" is house 7 of the street, "D2026-10-14" that date's Daily House
+const KEY_RE=/^(L[1-9]\d{0,3}|D\d{4}-\d{2}-\d{2})$/;
+function validKey(k){return typeof k==="string"&&KEY_RE.test(k);}
+function houseFor(key){
+  if(!validKey(key))return null;
+  if(key[0]==="L"){const L=+key.slice(1);return makeHouse((L*7919+31)>>>0,levelSpec(L),[...Array(castFor(L)).keys()],newTenant(L));}
+  return makeHouse(dailySeed(key.slice(1)),DAILY,[...Array(CAST.length).keys()],null);
+}
+
+function starsFor(n,moves,hints){return hints===0&&moves<=n+2?3:hints<=1&&moves<=2*n+2?2:1;}
+// the Daily House score for the leaderboard: higher is better
+function dailyScore(n,moves,hints,secs){return Math.max(1,1000-25*Math.max(0,moves-n)-100*hints-Math.min(300,Math.floor(secs)));}
+function dayIndex(d){const [y,m,dd]=String(d).split("-").map(Number);return Math.round(Date.UTC(y,m-1,dd)/864e5);}
+// a streak grows by one on the next calendar day and restarts after a missed day
+function nextStreak(prev,today){
+  if(!prev||!prev.date)return {date:today,streak:1};
+  const gap=dayIndex(today)-dayIndex(prev.date);
+  return gap===0?{date:prev.date,streak:prev.streak|0}:gap===1?{date:today,streak:(prev.streak|0)+1}:{date:today,streak:1};
+}
+
+function selfTestLogic(){
+  const problems=[];
+  if(CAST.length!==10||new Set(CAST.map(c=>c.id)).size!==10)problems.push("expected 10 different tenants");
+  for(const c of CAST){
+    if(!c.icon||!c.name||c.name.length>8)problems.push(c.id+": name "+c.name);
+    if(!c.bio||c.bio.length>50)problems.push(c.id+": bio is "+(c.bio||"").length+" characters");
+  }
+  if(castFor(1)!==5||castFor(3)!==5||castFor(16)!==10||castFor(99)!==10)problems.push("cast sizes");
+  if(JSON.stringify([4,7,10,13,16].map(newTenant))!=="[5,6,7,8,9]"||[1,2,3,5,6,17,40].some(L=>newTenant(L)!=null))problems.push("new tenants");
+  for(const st of STAGES)if(st.n>=st.cols*st.rows)problems.push("stage "+st.from+": no empty room");
+  // the solver on a small house: tenant 0 by the moonlit pane, tenant 1 next to it, then also in the attic
+  {
+    const h={cols:2,rows:2,n:2,win:[true,false,false,false],ms:[0,1]};
+    const a=countSolutions(h,[{k:"win",a:0},{k:"next",a:0,b:1}],9,1e6),b=countSolutions(h,[{k:"win",a:0},{k:"next",a:0,b:1},{k:"top",a:1}],9,1e6);
+    if(a.count!==2||b.count!==1||!a.done||!b.done)problems.push("solver: counted "+a.count+" and "+b.count);
+    const c=countSolutions(h,[{k:"alone",a:0}],9,1e6);
+    if(c.count!==4)problems.push("solver: 'no neighbours' counted "+c.count+" of 4");
+    const d=countSolutions({cols:3,rows:1,n:2,win:[false,false,false],ms:[0,1]},[{k:"company",a:0},{k:"leftOf",a:0,b:1}],9,1e6);
+    if(d.count!==2)problems.push("solver: 'needs a neighbour' counted "+d.count+" of 2");
+  }
+  const h33={cols:3,rows:3};
+  if(!adjacent(h33,0,1)||!adjacent(h33,0,3)||adjacent(h33,0,4)||adjacent(h33,2,3)||adjacent(h33,5,6))problems.push("which rooms share a wall");
+  const keys=[];for(let L=1;L<=36;L++)keys.push("L"+L);
+  for(let d=1;d<=10;d++)keys.push("D2026-10-"+String(d).padStart(2,"0"));
+  for(const key of keys){
+    const h=houseFor(key),w="house "+key;
+    if(!h){problems.push(w+": could not be built");continue;}
+    const L=key[0]==="L"?+key.slice(1):0,spec=L?levelSpec(L):DAILY,R=h.cols*h.rows;
+    if(h.cols!==spec.cols||h.rows!==spec.rows||h.n!==spec.n||h.ms.length!==h.n||h.sol.length!==h.n)problems.push(w+": wrong size");
+    if(new Set(h.sol).size!==h.n||h.sol.some(p=>!(p>=0&&p<R)))problems.push(w+": bad answer");
+    if(new Set(h.ms).size!==h.n||(L&&h.ms.some(id=>id>=castFor(L))))problems.push(w+": a tenant who has not moved to the street yet");
+    if(L&&newTenant(L)!=null&&!h.ms.includes(newTenant(L)))problems.push(w+": the new tenant is missing");
+    if(!(h.rules.length>=1&&h.rules.length<=MAX_RULES))problems.push(w+": "+h.rules.length+" rules");
+    for(const r of h.rules){
+      if(!spec.kinds.includes(r.k))problems.push(w+": a '"+r.k+"' rule before it is taught");
+      if(r.b!=null&&r.b===r.a)problems.push(w+": a rule about one tenant twice");
+      if(ruleStatus(h,r,h.sol)!=="ok")problems.push(w+": the answer breaks "+r.k);
+      if(CAST[h.ms[r.a]].avoid.includes(r.k))problems.push(w+": "+CAST[h.ms[r.a]].id+" got "+r.k);
+      if([...ruleText(r,h.ms)].length>26)problems.push(w+": the rule '"+ruleText(r,h.ms)+"' is too long");
+    }
+    const s=countSolutions(h,h.rules,2,1e7);
+    if(!s.done||s.count!==1)problems.push(w+": "+s.count+" answers");
+    if(JSON.stringify(houseFor(key))!==JSON.stringify(h))problems.push(w+": not the same twice");
+  }
+  if(JSON.stringify(houseFor("D2026-10-14").sol)===JSON.stringify(houseFor("D2026-10-15").sol)&&JSON.stringify(houseFor("D2026-10-14").win)===JSON.stringify(houseFor("D2026-10-15").win))problems.push("two days share a Daily House");
+  for(const bad of ["L0","L","X1","L10000","D2026-1-1","",null,undefined,"L1 ",{}])if(validKey(bad)||houseFor(bad))problems.push("the key "+JSON.stringify(bad)+" should not be a house");
+  if(starsFor(6,6,0)!==3||starsFor(6,8,0)!==3||starsFor(6,9,0)!==2||starsFor(6,6,1)!==2||starsFor(6,15,0)!==1||starsFor(6,6,2)!==1)problems.push("stars");
+  if(dailyScore(7,7,0,0)!==1000||dailyScore(7,9,1,30.6)!==820||dailyScore(7,500,9,9999)!==1||dailyScore(7,5,0,0)!==1000)problems.push("daily score");
+  const S=(p,t)=>JSON.stringify(nextStreak(p,t));
+  if(S({date:"",streak:0},"2026-10-14")!==JSON.stringify({date:"2026-10-14",streak:1}))problems.push("first streak");
+  if(S({date:"2026-10-13",streak:4},"2026-10-14")!==JSON.stringify({date:"2026-10-14",streak:5}))problems.push("next-day streak");
+  if(S({date:"2026-10-14",streak:4},"2026-10-14")!==JSON.stringify({date:"2026-10-14",streak:4}))problems.push("same-day streak");
+  if(S({date:"2026-10-12",streak:4},"2026-10-14")!==JSON.stringify({date:"2026-10-14",streak:1}))problems.push("missed-day streak");
+  if(S({date:"2026-10-31",streak:2},"2026-11-01")!==JSON.stringify({date:"2026-11-01",streak:3}))problems.push("month-end streak");
+  if(teachFor(1)!==STAGES[0].teach||teachFor(2)!==STAGES[0].teach||teachFor(3)!==STAGES[1].teach||teachFor(4)!==""||teachFor(25)!==STAGES[5].teach)problems.push("teaching lines");
+  return problems;
+}
+</script>
+
+<script>
+"use strict";
+// ---------- screen: a 720x1280 portrait street, letterboxed to any window or phone ----------
+const cv=document.getElementById("c");
+let g=cv.getContext("2d");
+const view={scale:1,ox:0,oy:0};
+function fit(){
+  const dpr=Math.min(window.devicePixelRatio||1,2),s=Math.min(innerWidth/W,innerHeight/H);
+  view.scale=s;view.ox=(innerWidth-W*s)/2;view.oy=(innerHeight-H*s)/2;
+  cv.style.left=view.ox+"px";cv.style.top=view.oy+"px";cv.style.width=W*s+"px";cv.style.height=H*s+"px";
+  cv.width=Math.max(1,Math.round(W*s*dpr));cv.height=Math.max(1,Math.round(H*s*dpr));
+  g.setTransform(cv.width/W,0,0,cv.height/H,0,0);
+}
+const BTN={sound:{x:556,y:16,w:148,h:56},hint:{x:24,y:1192,w:216,h:64},restart:{x:252,y:1192,w:216,h:64},mode:{x:480,y:1192,w:216,h:64}};
+const HOUSE_BOTTOM=688;
+function geom(h){const cell=Math.floor(Math.min(600/h.cols,456/h.rows,190)),w=cell*h.cols,hh=cell*h.rows;return {cell,x0:Math.round((W-w)/2),y0:HOUSE_BOTTOM-hh,w,h:hh};}
+function roomRect(h,p){const G=geom(h);return {x:G.x0+colOf(h,p)*G.cell,y:G.y0+rowOf(h,p)*G.cell,w:G.cell,h:G.cell};}
+function tokenRect(a,n){const tw=80,gap=6,x0=(W-(n*tw+(n-1)*gap))/2;return {x:x0+a*(tw+gap),y:704,w:tw,h:118};}
+function ruleRect(q){return {x:24+(q%2)*342,y:868+Math.floor(q/2)*46,w:330,h:40};}
+const RESULT_BOX={x:60,y:240,w:600,h:780},RESULT_NEXT={x:160,y:900,w:400,h:84};
+const RESULT_NEXT_S={x:84,y:900,w:360,h:84},SHARE_BTN={x:460,y:900,w:176,h:84};
+const TENANT_BOX={x:80,y:330,w:560,h:580},TENANT_BTN={x:180,y:800,w:360,h:76};
+
+// ---------- RUN: the RUN build loads RUN's SDK before this script; anywhere else RUN stays null ----------
+const RUN=window.RundotGameAPI||null;
+// every SDK call can throw or reject: each one goes through sdk() and gets a .catch, so none can break the game
+function sdk(fn){try{const p=fn();return p&&typeof p.then==="function"?p:Promise.resolve(p);}catch(e){return Promise.reject(e);}}
+const has=(o,f)=>!!(o&&typeof o[f]==="function");
+
+// ---------- progress: this browser's storage, and RUN's player storage on RUN ----------
+const SAVE_KEY="monsterroommates.v1",RUN_KEY="monsterroommates_v1";   // RUN storage keys may not contain a dot
+const coverMode=location.hash==="#cover",testMode=location.hash==="#selftest";
+let demo=location.hash==="#demo",noSave=demo,save=load();
+let ready=!RUN||demo||coverMode||testMode;     // on RUN, input waits (at most 4 s) for the saved street
+let runLoaded=!RUN;                            // and nothing is written to RUN until it has been read
+function fresh(){return {level:1,mode:"street",stars:{},hints:3,solved:0,daily:{date:"",streak:0},dailyDone:"",dailyScore:0,friend:"",friendMoves:0,cur:null,met:5,mute:false};}
+function parseCur(c){
+  if(!c||typeof c!=="object"||!validKey(c.key)||!Array.isArray(c.pos))return null;
+  return {key:String(c.key),pos:c.pos.map(x=>x|0),fixed:Array.isArray(c.fixed)?c.fixed.map(Boolean):[],moves:Math.max(0,c.moves|0),hints:Math.max(0,c.hints|0),secs:Math.max(0,+c.secs||0)};
+}
+function parseSave(raw){
+  const f=fresh();
+  try{
+    const s=JSON.parse(raw||"null");if(!s||typeof s!=="object")return f;
+    const stars={};
+    if(s.stars&&typeof s.stars==="object")for(const k of Object.keys(s.stars))if(/^\d{1,4}$/.test(k))stars[k]=clamp(s.stars[k]|0,1,3);
+    const friend=validKey(s.friend)?s.friend:"";
+    let mode=["street","daily","friend"].includes(s.mode)?s.mode:"street";
+    if(mode==="friend"&&!friend)mode="street";
+    return {level:clamp(s.level|0,1,9999),mode,stars,hints:s.hints==null?f.hints:clamp(s.hints|0,0,99),solved:Math.max(0,s.solved|0),
+      daily:s.daily&&typeof s.daily.date==="string"?{date:s.daily.date,streak:Math.max(0,s.daily.streak|0)}:f.daily,
+      dailyDone:typeof s.dailyDone==="string"?s.dailyDone:"",dailyScore:Math.max(0,s.dailyScore|0),friend,friendMoves:Math.max(0,s.friendMoves|0),
+      cur:parseCur(s.cur),met:clamp(s.met|0,5,CAST.length),mute:!!s.mute};
+  }catch(e){return f;}
+}
+function load(){try{return parseSave(localStorage.getItem(SAVE_KEY));}catch(e){return fresh();}}
+function store(){
+  if(noSave)return;
+  const s=JSON.stringify(save);
+  try{localStorage.setItem(SAVE_KEY,s);}catch(e){}
+  if(RUN&&runLoaded&&RUN.appStorage)sdk(()=>RUN.appStorage.setItem(RUN_KEY,s)).catch(()=>{});
+}
+function today(){const d=new Date();return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0");}
+function untilMidnight(){const n=new Date(),m=new Date(n.getFullYear(),n.getMonth(),n.getDate()+1),s=Math.max(0,Math.floor((m-n)/1000));return Math.floor(s/3600)+"h "+String(Math.floor(s/60)%60).padStart(2,"0")+"m";}
+
+// ---------- audio: synthesized sounds (html-jam-kit); nothing starts before a click, touch or key ----------
+const midiHz=m=>440*Math.pow(2,(m-69)/12),easeOut=x=>1-Math.pow(1-Math.max(0,Math.min(1,x)),3);
+const audio=(()=>{
+  let ac=null,master=null,on=true;
+  function ensure(){
+    if(ac)return true;
+    try{ac=new (window.AudioContext||window.webkitAudioContext)();master=ac.createGain();master.gain.value=on?0.8:0;master.connect(ac.destination);return true;}catch(e){ac=null;return false;}
+  }
+  return{
+    unlock(){if(ensure()&&ac.state==="suspended"&&!document.hidden)ac.resume().catch(()=>{});},
+    started(){return !!ac;},
+    isOn(){return on;},
+    toggle(){on=!on;if(master)master.gain.value=on?0.8:0;return on;},
+    pause(hidden){if(!ac)return;try{hidden?ac.suspend():ac.resume();}catch(e){}},
+    tone(f,d,type,vol,delay){if(!ac)return;const t0=ac.currentTime+(delay||0),o=ac.createOscillator(),e=ac.createGain();o.type=type||"sine";o.frequency.value=f;e.gain.setValueAtTime(vol||0.08,t0);e.gain.exponentialRampToValueAtTime(0.0001,t0+d);o.connect(e);e.connect(master);o.start(t0);o.stop(t0+d+0.02);},
+    tune(notes,bpm,type,vol){if(!ac)return;let t=0;const beat=60/(bpm||120);for(const [n,b] of notes){if(n!=null)this.tone(midiHz(n),b*beat*0.9,type||"triangle",vol||0.05,t);t+=b*beat;}}
+  };
+})();
+document.addEventListener("visibilitychange",()=>audio.pause(document.hidden));
+const sfx={
+  pick:a=>audio.tone(midiHz(64+[0,3,5,7,10,12,15,17,19,22][a%10]),0.12,"triangle",0.05),
+  place:()=>{audio.tone(392,0.08,"sine",0.06);audio.tone(523,0.1,"sine",0.04,0.06);},
+  drop:()=>audio.tone(300,0.08,"triangle",0.04),
+  nope:()=>audio.tone(140,0.15,"square",0.03),
+  bump:()=>{audio.tone(70,0.25,"sine",0.25);audio.tone(55,0.3,"sine",0.2,0.06);},
+  hint:()=>audio.tune([[76,0.25],[83,0.5]],300,"sine",0.04),
+  win:()=>audio.tune([[67,0.25],[72,0.25],[76,0.25],[79,0.75]],320,"triangle",0.05),
+  stars:n=>{for(let q=0;q<n;q++)audio.tone(midiHz(76+q*4),0.25,"triangle",0.05,0.5+q*0.18);}
+};
+
+// ---------- game state ----------
+const now=()=>performance.now()/1000;
+let house=null,key="",pos=[],fixed=[],moves=0,used=0,secs=0,sel=null,phase="play",overlay=null,tenantIdx=0;
+let result=null,resultAt=0,mouse=null,parts=[],toast="",toastUntil=0,bumps={},demoNext=0,dailyRank=0;
+let adReady=false,adBusy=false,shareBusy=false;
+const houseCache=new Map();
+function getHouse(k){if(!houseCache.has(k))houseCache.set(k,houseFor(k));return houseCache.get(k);}
+function currentKey(){return save.mode==="daily"?"D"+today():save.mode==="friend"&&save.friend?save.friend:"L"+save.level;}
+function say(text,secs){toast=text;toastUntil=now()+(secs||2.5);}
+const occupant=p=>pos.indexOf(p);
+
+function openHouse(){
+  key=currentKey();house=getHouse(key);
+  if(!house){save.mode="street";save.friend="";key="L"+save.level;house=getHouse(key);}
+  const R=house.cols*house.rows,c=save.cur,placed=c?c.pos.filter(p=>p>=0):[];
+  if(c&&c.key===key&&c.pos.length===house.n&&c.pos.every(p=>p>=-1&&p<R)&&new Set(placed).size===placed.length){
+    pos=c.pos.slice();fixed=house.ms.map((_,a)=>!!c.fixed[a]&&pos[a]===house.sol[a]);moves=c.moves;used=c.hints;secs=c.secs;
+  }else{pos=house.ms.map(()=>-1);fixed=house.ms.map(()=>false);moves=0;used=0;secs=0;}
+  sel=null;phase="play";result=null;bumps={};overlay=null;
+  if(save.mode==="street"){const nt=newTenant(save.level);if(nt!=null&&save.met<=nt){overlay="tenant";tenantIdx=nt;}}
+  checkAd();
+}
+function saveCur(){save.cur={key,pos:pos.slice(),fixed:fixed.slice(),moves,hints:used,secs:Math.round(secs)};store();}
+function badSet(){const s=new Set();house.rules.forEach((r,q)=>{if(ruleStatus(house,r,pos)==="bad")s.add(q);});return s;}
+// a rule that has just broken makes its rooms go bump; a full house with every rule kept is solved
+function afterMove(before){
+  const t=now();let bumped=null;
+  house.rules.forEach((r,q)=>{
+    if(ruleStatus(house,r,pos)!=="bad"||before.has(q))return;
+    bumped=r;
+    for(const m of [r.a,r.b])if(m!=null&&pos[m]>=0)bumps[pos[m]]=t;
+  });
+  if(bumped){sfx.bump();say("Bump! “"+ruleText(bumped,house.ms)+"” is broken.");}
+  if(pos.every(p=>p>=0)&&house.rules.every(r=>ruleStatus(house,r,pos)==="ok"))win();
+  else saveCur();
+}
+// moves tenant a into room p; whoever lives there swaps to a's old room (or goes back to the doorstep)
+function place(a,p){
+  if(phase!=="play"||overlay||a==null||fixed[a])return false;
+  const o=occupant(p);
+  if(o===a)return false;
+  if(o>=0&&fixed[o]){sfx.nope();say("A tenant placed by a hint stays put.");return false;}
+  const before=badSet();
+  if(o>=0)pos[o]=pos[a];
+  pos[a]=p;moves++;sel=null;
+  sfx.place();afterMove(before);
+  return true;
+}
+function unplace(a){
+  if(phase!=="play"||fixed[a]||pos[a]<0)return false;
+  const before=badSet();pos[a]=-1;sel=null;sfx.drop();afterMove(before);
+  return true;
+}
+function tapTenant(a){
+  if(phase!=="play"||overlay||a<0||a>=house.n)return;
+  if(fixed[a]){sfx.nope();say(CAST[house.ms[a]].name+" was placed by a hint and stays put.");return;}
+  if(sel===a){if(pos[a]>=0)unplace(a);else sel=null;return;}
+  sel=a;sfx.pick(house.ms[a]);
+}
+function tapRoom(p){
+  if(phase!=="play"||overlay)return;
+  const o=occupant(p);
+  if(sel!=null){if(o===sel)sel=null;else place(sel,p);return;}
+  if(o>=0){if(fixed[o]){sfx.nope();say("A tenant placed by a hint stays put.");return;}sel=o;sfx.pick(house.ms[o]);}
+}
+function hint(){
+  if(phase!=="play"||overlay)return;
+  if(save.hints<=0){if(adOffer())watchAd();else{sfx.nope();say("No hints left. Every third house earns one.");}return;}
+  let a=-1;
+  for(let q=0;q<house.n;q++)if(!fixed[q]&&pos[q]!==house.sol[q]){a=q;break;}
+  if(a<0)return;
+  const p=house.sol[a],o=occupant(p),before=badSet();
+  if(o>=0)pos[o]=-1;
+  pos[a]=p;fixed[a]=true;used++;save.hints--;sel=null;
+  sfx.hint();
+  if(save.hints<=0)checkAd();
+  afterMove(before);
+}
+function restart(){
+  if(phase!=="play"||overlay)return;
+  for(let a=0;a<house.n;a++)if(!fixed[a])pos[a]=-1;
+  sel=null;bumps={};sfx.drop();saveCur();
+}
+function switchMode(){
+  if(overlay||phase!=="play")return;
+  save.mode=save.mode==="street"?"daily":"street";save.friend="";save.friendMoves=0;save.cur=null;
+  store();openHouse();
+}
+function win(){
+  phase="won";resultAt=now();sel=null;dailyRank=0;
+  const mode=save.mode;
+  result={stars:starsFor(house.n,moves,used),moves,used,mode,score:0,first:false,streak:0,friendMoves:0,bonus:"",level:save.level};
+  if(mode==="street"){
+    const L=save.level;save.stars[L]=Math.max(save.stars[L]|0,result.stars);save.level=L+1;save.solved++;
+    if(save.solved%3===0){save.hints++;result.bonus="+1 💡 hint for three more houses";}
+  }else if(mode==="daily"){
+    const d=today();
+    if(save.dailyDone!==d){
+      result.first=true;save.dailyDone=d;save.daily=nextStreak(save.daily,d);result.streak=save.daily.streak;
+      result.score=dailyScore(house.n,moves,used,secs);save.dailyScore=result.score;save.hints++;result.bonus="+1 💡 hint for today's house";
+      submitDaily(result.score,secs);remindDaily();
+    }
+  }else{
+    result.friendMoves=save.friendMoves;save.hints++;result.bonus="+1 💡 hint for your friend's house";save.friend="";save.friendMoves=0;
+  }
+  save.cur=null;store();
+  sfx.win();sfx.stars(result.stars);
+  const G=geom(house);burst(W/2,G.y0+G.h/2,["#ffd84a","#ff8ab0","#7ddc4a","#cfe3ff"],40);
+}
+function next(){
+  if(phase!=="won"||now()<resultAt+0.5)return;
+  if(save.mode!=="street"){save.mode="street";store();}
+  openHouse();
+}
+function closeTenant(){save.met=Math.max(save.met,tenantIdx+1);overlay=null;store();}
+
+// ---------- RUN extras: the saved street, a friend's house, sharing, the daily leaderboard, an optional ad, a reminder ----------
+function startRun(){
+  const finish=raw=>{
+    if(runLoaded)return;
+    runLoaded=true;
+    if(raw){save=parseSave(raw);if(save.mute===audio.isOn())audio.toggle();openHouse();}
+    ready=true;readInvite();
+  };
+  setTimeout(()=>{if(!ready){ready=true;say("Still fetching your saved street…",4);}},4000);
+  sdk(()=>RUN.appStorage.getItem(RUN_KEY)).then(finish,()=>finish(null));
+}
+// a friend's share link carries a house (and how many moves the friend needed); it opens straight away
+function readInvite(){
+  if(!has(RUN&&RUN.app,"resolveLaunchIntent"))return;
+  sdk(()=>RUN.app.resolveLaunchIntent({maxWaitMs:800})).then(intent=>{
+    const p=intent&&intent.kind==="share"&&intent.params?intent.params:null;
+    if(!p||!validKey(p.house)||!getHouse(p.house))return;
+    const fm=parseInt(p.moves,10);
+    save.friend=p.house;save.friendMoves=fm>0&&fm<1000?fm:0;save.mode="friend";save.cur=null;
+    store();openHouse();
+    say(save.friendMoves?"A friend sent you a house! Can you beat "+save.friendMoves+" moves?":"A friend sent you a house!",5);
+  }).catch(()=>{});
+}
+const canShare=()=>has(RUN&&RUN.social,"shareLinkAsync");
+const nextBtn=()=>canShare()?RESULT_NEXT_S:RESULT_NEXT;
+function shareHouse(){
+  if(!canShare()||shareBusy||!result)return;
+  shareBusy=true;
+  sdk(()=>RUN.social.shareLinkAsync({shareParams:{house:key,moves:String(result.moves)},slug:"house"+key.replace(/-/g,""),
+    metadata:{title:"Can you house my monsters?",description:"I moved "+house.n+" monsters in with "+result.moves+" moves, and every house rule stayed green."}}))
+    .then(()=>say("Your house is ready to share!"),()=>say("Sharing didn't work this time."))
+    .then(()=>{shareBusy=false;});
+}
+function submitDaily(score,s){
+  if(noSave||!has(RUN&&RUN.leaderboard,"submitScore"))return;
+  sdk(()=>RUN.leaderboard.submitScore({score,duration:Math.max(1,Math.round(s))})).then(r=>{if(r&&r.accepted&&r.rank)dailyRank=r.rank|0;}).catch(()=>{});
+}
+// an optional rewarded ad gives two hints, offered only when the hints have run out and RUN says one is ready
+const adOffer=()=>phase==="play"&&adReady&&!adBusy&&save.hints<=0;
+function checkAd(){
+  adReady=false;
+  if(demo||save.hints>0||!has(RUN&&RUN.ads,"isRewardedAdReadyAsync"))return;
+  sdk(()=>RUN.ads.isRewardedAdReadyAsync()).then(ok=>{adReady=ok===true;},()=>{});
+}
+function watchAd(){
+  if(!adOffer())return;
+  adBusy=true;
+  sdk(()=>RUN.ads.showRewardedAdAsync({adDisplayId:"two_hints",adDisplayName:"Two hints"})).then(earned=>{
+    if(earned===true){save.hints+=2;store();sfx.hint();say("Two hints! Tap 💡 to use one.");}
+  },()=>{}).then(()=>{adBusy=false;adReady=false;});
+}
+// after today's Daily House: a reminder tomorrow at 6 pm, when the next one opens
+function remindDaily(){
+  if(noSave||!has(RUN&&RUN.notifications,"submitMessageAsync"))return;
+  const n=new Date(),at=new Date(n.getFullYear(),n.getMonth(),n.getDate()+1,18,0,0),days=save.daily.streak|0;
+  sdk(()=>RUN.notifications.submitMessageAsync({channels:["local"],title:"New tenants are at the door 🏚️",
+    body:"Move in today's Daily House to keep your "+days+"-day streak.",triggerAt:at.toISOString(),notificationId:"daily-house"})).catch(()=>{});
+}
+
+// ---------- input: mouse, touch and pen through pointer events, plus keys ----------
+const inside=(b,x,y)=>x>=b.x&&y>=b.y&&x<b.x+b.w&&y<b.y+b.h;
+function toLogical(e){return [(e.clientX-view.ox)/view.scale,(e.clientY-view.oy)/view.scale];}
+function roomAt(x,y){const R=house.cols*house.rows;for(let p=0;p<R;p++)if(inside(roomRect(house,p),x,y))return p;return -1;}
+function press(x,y){
+  if(demo||!ready)return;
+  if(overlay==="tenant"){if(inside(TENANT_BTN,x,y)||!inside(TENANT_BOX,x,y))closeTenant();return;}
+  if(inside(BTN.sound,x,y)){audio.toggle();save.mute=!audio.isOn();store();return;}
+  if(phase==="won"){
+    if(inside(nextBtn(),x,y))next();
+    else if(canShare()&&now()>=resultAt+0.5&&inside(SHARE_BTN,x,y))shareHouse();
+    return;
+  }
+  if(inside(BTN.hint,x,y)){hint();return;}
+  if(inside(BTN.restart,x,y)){restart();return;}
+  if(inside(BTN.mode,x,y)){switchMode();return;}
+  for(let a=0;a<house.n;a++)if(inside(tokenRect(a,house.n),x,y)){tapTenant(a);return;}
+  const p=roomAt(x,y);
+  if(p>=0){tapRoom(p);return;}
+  sel=null;
+}
+addEventListener("pointerdown",e=>{if(coverMode)return;audio.unlock();const [x,y]=toLogical(e);mouse={x,y};press(x,y);e.preventDefault();},{passive:false});
+addEventListener("pointermove",e=>{const [x,y]=toLogical(e);mouse=e.pointerType==="mouse"?{x,y}:null;});
+addEventListener("contextmenu",e=>{if(!coverMode)e.preventDefault();});
+addEventListener("keydown",e=>{
+  audio.unlock();
+  if(e.key==="m"||e.key==="M"){audio.toggle();save.mute=!audio.isOn();store();return;}
+  if(demo||!ready)return;
+  const k=e.key;
+  if(k===" "||k==="Enter")e.preventDefault();
+  if(overlay==="tenant"){if(k===" "||k==="Enter"||k==="Escape")closeTenant();return;}
+  if(phase==="won"){if(k===" "||k==="Enter")next();return;}
+  if(k==="Escape"){sel=null;return;}
+  if(k==="h"||k==="H"){hint();return;}
+  if(k==="r"||k==="R"){restart();return;}
+  if(k==="d"||k==="D"){switchMode();return;}
+  if(k.length===1&&k>="1"&&k<="9"&&+k<=house.n)tapTenant(+k-1);
+});
+addEventListener("resize",fit);
+
+// ---------- drawing ----------
+const INK="#1a1426";
+function rr(x,y,w,h,r){g.beginPath();g.moveTo(x+r,y);g.arcTo(x+w,y,x+w,y+h,r);g.arcTo(x+w,y+h,x,y+h,r);g.arcTo(x,y+h,x,y,r);g.arcTo(x,y,x+w,y,r);g.closePath();}
+function wrap(text,maxW){const lines=[];let line="";for(const w of text.split(" ")){const t=line?line+" "+w:w;if(g.measureText(t).width>maxW&&line){lines.push(line);line=w;}else line=t;}if(line)lines.push(line);return lines;}
+function centre(text,x,y){g.textAlign="center";g.textBaseline="middle";g.fillText(text,x,y);g.textBaseline="alphabetic";}
+function starShape(x,y,r,fill){g.beginPath();for(let k=0;k<10;k++){const a=-Math.PI/2+k*Math.PI/5,d=k%2?r*0.45:r;g.lineTo(x+Math.cos(a)*d,y+Math.sin(a)*d);}g.closePath();g.fillStyle=fill?"#ffc93c":"#d8cce8";g.fill();g.strokeStyle="#9a6f00";g.lineWidth=2;g.stroke();}
+function drawStars(cx,cy,n,r){for(let k=0;k<3;k++)starShape(cx+(k-1)*r*2.6,cy,r,k<n);}
+function drawButton(b,label,primary,size){
+  const hot=mouse&&inside(b,mouse.x,mouse.y);
+  g.fillStyle=primary?(hot?"#a46cff":"#8f52f5"):(hot?"#4a3a6e":"#3a2d58");rr(b.x,b.y,b.w,b.h,18);g.fill();
+  g.strokeStyle=primary?"#d9c2ff":"#ffffff30";g.lineWidth=3;g.stroke();
+  g.fillStyle="#ffffff";g.font="bold "+(size||26)+"px system-ui,sans-serif";centre(label,b.x+b.w/2,b.y+b.h/2+2);
+}
+function drawBackground(w,h,t){
+  const gr=g.createLinearGradient(0,0,0,h);gr.addColorStop(0,"#161230");gr.addColorStop(0.5,"#2c2150");gr.addColorStop(1,"#141026");
+  g.fillStyle=gr;g.fillRect(0,0,w,h);
+  for(let q=0;q<40;q++){g.fillStyle="rgba(255,255,230,"+(0.25+0.25*Math.sin(t*1.3+q)).toFixed(3)+")";g.fillRect((q*137.5)%w,(q*71.3)%(h*0.5),2,2);}
+  const u=Math.min(w,h);
+  g.fillStyle="#fff4d0";g.globalAlpha=0.9;g.beginPath();g.arc(w*0.86,h*0.13,u*0.06,0,7);g.fill();
+  g.fillStyle="#2c2150";g.beginPath();g.arc(w*0.86+u*0.025,h*0.13-u*0.012,u*0.052,0,7);g.fill();g.globalAlpha=1;
+}
+// the house: roof, rooms (attic planks, cellar stones, moonlit panes), walls, then the tenants who have moved in
+function drawHouseBox(h,x0,y0,cell,t,occ,o){
+  o=o||{};
+  const w=cell*h.cols,hh=cell*h.rows,roofH=Math.max(10,o.roofH||cell*0.6),lw=Math.max(2,cell*0.045);
+  g.fillStyle="#24402c";g.fillRect(x0-cell*0.6,y0+hh-2,w+cell*1.2,Math.max(6,cell*0.08));
+  g.fillStyle="#4a3456";g.fillRect(x0+w*0.7,y0-roofH*0.95,cell*0.16,roofH*0.7);
+  g.fillStyle="#3b2a4a";g.beginPath();g.moveTo(x0-cell*0.18,y0+2);g.lineTo(x0+w/2,y0-roofH);g.lineTo(x0+w+cell*0.18,y0+2);g.closePath();g.fill();
+  g.strokeStyle=INK;g.lineWidth=lw;g.stroke();
+  for(let p=0;p<h.cols*h.rows;p++){
+    const r=rowOf(h,p),x=x0+colOf(h,p)*cell,y=y0+r*cell;
+    g.fillStyle=r===0?"#7a5238":r===h.rows-1?"#3e3c4e":"#4b3a6b";g.fillRect(x,y,cell,cell);
+    g.lineWidth=2;
+    if(r===h.rows-1){g.strokeStyle="#ffffff12";for(let q=1;q<4;q++){g.beginPath();g.moveTo(x,y+q*cell/4);g.lineTo(x+cell,y+q*cell/4);g.stroke();}}
+    else if(r===0){g.strokeStyle="#00000026";for(let q=1;q<4;q++){g.beginPath();g.moveTo(x+q*cell/4,y);g.lineTo(x+q*cell/4,y+cell);g.stroke();}}
+    if(h.win[p]){
+      const ww=cell*0.36,wh=cell*0.3,wx=x+(cell-ww)/2,wy=y+cell*0.1;
+      g.fillStyle="#ffe9a8";g.globalAlpha=0.22;g.fillRect(wx-cell*0.05,wy-cell*0.05,ww+cell*0.1,wh+cell*0.1);g.globalAlpha=1;
+      g.fillStyle="#fff1bd";g.fillRect(wx,wy,ww,wh);
+      g.strokeStyle=INK;g.lineWidth=Math.max(2,cell*0.025);g.strokeRect(wx,wy,ww,wh);
+      g.beginPath();g.moveTo(wx+ww/2,wy);g.lineTo(wx+ww/2,wy+wh);g.moveTo(wx,wy+wh/2);g.lineTo(wx+ww,wy+wh/2);g.stroke();
+    }
+    if(o.hot===p){g.fillStyle="#ffffff22";g.fillRect(x,y,cell,cell);}
+  }
+  g.strokeStyle=INK;g.lineWidth=lw;
+  for(let c=0;c<=h.cols;c++){g.beginPath();g.moveTo(x0+c*cell,y0);g.lineTo(x0+c*cell,y0+hh);g.stroke();}
+  for(let r=0;r<=h.rows;r++){g.beginPath();g.moveTo(x0,y0+r*cell);g.lineTo(x0+w,y0+r*cell);g.stroke();}
+  for(let a=0;a<occ.length;a++){
+    const p=occ[a];if(p<0)continue;
+    const top=y0+rowOf(h,p)*cell,bt=o.bumps&&o.bumps[p]!=null?t-o.bumps[p]:9;
+    let x=x0+(colOf(h,p)+0.5)*cell;
+    const y=top+cell*0.62;
+    if(bt>=0&&bt<0.6)x+=Math.sin(bt*60)*cell*0.05*(1-bt/0.6);
+    const hop=o.happy?Math.abs(Math.sin(t*5+a))*cell*0.08:Math.sin(t*2+a*1.3)*cell*0.015;
+    if(o.sel===a){g.fillStyle="rgba(255,216,74,0.35)";g.beginPath();g.arc(x,y-hop,cell*0.36,0,7);g.fill();}
+    g.fillStyle="#ffffff";g.font=Math.round(cell*0.46)+"px system-ui,sans-serif";centre(CAST[h.ms[a]].icon,x,y-hop);
+    if(o.fixed&&o.fixed[a]){g.font=Math.round(cell*0.16)+"px system-ui,sans-serif";centre("💡",x+cell*0.34,top+cell*0.86);}
+    if(bt>=0&&bt<0.9){g.globalAlpha=Math.max(0,1-bt/0.9);g.fillStyle="#ff6a5a";g.font="bold "+Math.round(cell*0.17)+"px system-ui,sans-serif";centre("BUMP!",x,top+cell*0.14);g.globalAlpha=1;}
+  }
+  if(o.labels){
+    g.textAlign="right";g.textBaseline="middle";g.fillStyle="#c9b8e8";g.font="600 15px system-ui,sans-serif";
+    g.fillText("Attic",x0-8,y0+cell/2);g.fillText("Cellar",x0-8,y0+hh-cell/2);g.textBaseline="alphabetic";
+  }
+}
+function drawTop(){
+  g.textAlign="left";g.fillStyle="#f3e9ff";g.font="bold 34px system-ui,sans-serif";
+  g.fillText(save.mode==="daily"?"📅 Daily House":save.mode==="friend"?"✉️ A friend's house":"🏠 House "+save.level,26,52);
+  g.font="20px system-ui,sans-serif";g.fillStyle="#c9b8e8";
+  const n=save.daily.streak|0;
+  g.fillText(save.mode==="daily"?"The same house for everyone today · new in "+untilMidnight()
+    :save.mode==="friend"?(save.friendMoves?"Your friend needed "+save.friendMoves+" moves":"Sent by a friend")
+    :house.n+" tenants · "+house.cols*house.rows+" rooms"+(n&&save.dailyDone===today()?" · 🔥 "+n+"-day streak":""),28,86);
+  g.textAlign="right";g.fillStyle="#ffe9a8";g.font="600 22px system-ui,sans-serif";g.fillText("Moves: "+moves,700,104);
+  drawButton(BTN.sound,audio.isOn()?"🔊 Sound":"🔇 Sound",false,22);
+}
+function drawTray(t){
+  for(let a=0;a<house.n;a++){
+    const r=tokenRect(a,house.n),c=CAST[house.ms[a]],placed=pos[a]>=0,on=sel===a;
+    if(placed){
+      g.strokeStyle=on?"#ffd84a":"#ffffff30";g.lineWidth=on?4:2;g.setLineDash([6,6]);rr(r.x,r.y,r.w,r.h,14);g.stroke();g.setLineDash([]);
+      g.globalAlpha=0.35;g.fillStyle="#ffffff";g.font="30px system-ui,sans-serif";centre(c.icon,r.x+r.w/2,r.y+46);g.globalAlpha=1;
+    }else{
+      g.fillStyle=on?"#6a4fa0":"#3a2d58";rr(r.x,r.y,r.w,r.h,14);g.fill();
+      g.strokeStyle=on?"#ffd84a":"#ffffff22";g.lineWidth=on?4:2;g.stroke();
+      g.fillStyle="#ffffff";g.font="46px system-ui,sans-serif";centre(c.icon,r.x+r.w/2,r.y+48+(on?Math.sin(t*6)*3:0));
+    }
+    g.fillStyle=placed?"#8a7aa8":"#f3e9ff";g.font="600 15px system-ui,sans-serif";centre(c.name,r.x+r.w/2,r.y+98);
+    g.textAlign="left";g.font="13px system-ui,sans-serif";g.fillStyle="#ffffff55";g.fillText(String(a+1),r.x+7,r.y+17);
+  }
+}
+function infoLine(){
+  if(toast&&now()<toastUntil)return toast;
+  if(sel!=null){const c=CAST[house.ms[sel]];return pos[sel]>=0?c.name+": tap a room, or tap again to send back.":c.name+" the "+c.kind+": tap a room to move in.";}
+  return save.mode==="street"?teachFor(save.level):"";
+}
+function drawRules(){
+  house.rules.forEach((r,q)=>{
+    const b=ruleRect(q),s=ruleStatus(house,r,pos),mine=sel!=null&&(r.a===sel||r.b===sel);
+    g.fillStyle=s==="ok"?"#24452f":s==="bad"?"#5a2430":"#2e2546";rr(b.x,b.y,b.w,b.h,12);g.fill();
+    g.strokeStyle=mine?"#ffd84a":s==="ok"?"#5fd35a":s==="bad"?"#ff6a5a":"#ffffff22";g.lineWidth=mine?3:2;g.stroke();
+    g.fillStyle=s==="ok"?"#5fd35a":s==="bad"?"#ff6a5a":"#6a5a8a";g.beginPath();g.arc(b.x+20,b.y+b.h/2,8,0,7);g.fill();
+    g.textAlign="left";g.textBaseline="middle";g.fillStyle="#f3e9ff";g.font="600 20px system-ui,sans-serif";
+    g.fillText(ruleText(r,house.ms),b.x+38,b.y+b.h/2+1);g.textBaseline="alphabetic";
+  });
+}
+function hintLabel(){return save.hints>0?"💡 Hint ("+save.hints+")":adOffer()?"▶ Ad: +2 💡":"💡 Hint (0)";}
+// houses 1 and 2: a ring shows the next tap
+function drawGuide(t){
+  if(save.mode!=="street"||save.level>2||phase!=="play"||overlay||demo)return;
+  let a=-1;for(let q=0;q<house.n;q++)if(!fixed[q]&&pos[q]!==house.sol[q]){a=q;break;}
+  if(a<0)return;
+  const tgt=sel===a?roomRect(house,house.sol[a]):sel==null?(pos[a]>=0?roomRect(house,pos[a]):tokenRect(a,house.n)):null;
+  if(!tgt)return;
+  g.strokeStyle="rgba(255,216,74,"+(0.55+0.45*Math.sin(t*6)).toFixed(3)+")";g.lineWidth=6;rr(tgt.x-5,tgt.y-5,tgt.w+10,tgt.h+10,18);g.stroke();
+}
+function dim(){g.fillStyle="rgba(0,0,0,0.55)";g.fillRect(0,0,W,H);}
+function drawResult(t){
+  const r=result,b=RESULT_BOX,cx=360;
+  dim();g.fillStyle="#fff8ee";rr(b.x,b.y,b.w,b.h,26);g.fill();
+  g.fillStyle="#5a2d8a";g.font="bold 44px system-ui,sans-serif";centre("Everyone's happy!",cx,b.y+70);
+  g.fillStyle="#5a4a6a";g.font="24px system-ui,sans-serif";
+  centre(r.mode==="daily"?"Today's Daily House is full":r.mode==="friend"?"Your friend's house is full":"House "+r.level+" is full",cx,b.y+120);
+  drawStars(cx,b.y+200,r.stars,34);
+  g.fillStyle="#2a1f3a";g.font="600 28px system-ui,sans-serif";centre("Moves: "+r.moves+(r.used?"  ·  hints: "+r.used:""),cx,b.y+290);
+  g.fillStyle="#5a4a6a";g.font="22px system-ui,sans-serif";
+  centre(r.stars===3?"A perfect move-in!":"3 stars: no hints and at most "+(house.n+2)+" moves",cx,b.y+334);
+  g.fillStyle="#2a1f3a";g.font="600 26px system-ui,sans-serif";
+  if(r.mode==="daily"&&r.first){
+    centre("Score: "+r.score+(dailyRank?"  ·  rank #"+dailyRank:""),cx,b.y+404);
+    centre("🔥 Streak: "+r.streak+(r.streak===1?" day":" days"),cx,b.y+448);
+  }else if(r.mode==="daily")centre("Already done today (score "+save.dailyScore+")",cx,b.y+404);
+  else if(r.mode==="friend"&&r.friendMoves)
+    centre(r.moves<r.friendMoves?"You beat your friend's "+r.friendMoves+" moves!":r.moves===r.friendMoves?"A tie with your friend: "+r.friendMoves+" moves":"Your friend needed "+r.friendMoves+" moves",cx,b.y+404);
+  if(r.bonus){g.fillStyle="#9a6f00";g.font="bold 24px system-ui,sans-serif";centre(r.bonus,cx,b.y+500);}
+  g.fillStyle="#ffffff";g.font="44px system-ui,sans-serif";
+  house.ms.forEach((id,a)=>centre(CAST[id].icon,cx+(a-(house.n-1)/2)*64,b.y+580-Math.abs(Math.sin(t*5+a))*14));
+  if(t>=resultAt+0.5){
+    drawButton(nextBtn(),r.mode==="street"?"Next house ▶":"Back to the street ▶",true,28);
+    if(canShare())drawButton(SHARE_BTN,"🔗 Share",false,26);
+  }
+}
+function drawTenant(t){
+  const b=TENANT_BOX,c=CAST[tenantIdx],cx=360;
+  dim();g.fillStyle="#fff8ee";rr(b.x,b.y,b.w,b.h,26);g.fill();
+  g.fillStyle="#5a2d8a";g.font="bold 42px system-ui,sans-serif";centre("A new tenant!",cx,b.y+64);
+  g.fillStyle="#ffffff";g.font="150px system-ui,sans-serif";centre(c.icon,cx,b.y+210+Math.sin(t*3)*8);
+  g.fillStyle="#2a1f3a";g.font="bold 38px system-ui,sans-serif";centre(c.name+" the "+c.kind,cx,b.y+340);
+  g.fillStyle="#5a4a6a";g.font="24px system-ui,sans-serif";wrap(c.bio,480).slice(0,2).forEach((l,q)=>centre(l,cx,b.y+392+q*32));
+  drawButton(TENANT_BTN,"Welcome!",true,30);
+}
+function burst(x,y,cols,count){
+  for(let k=0;k<count;k++){const a=Math.random()*Math.PI*2,v=80+Math.random()*180;parts.push({x,y,vx:Math.cos(a)*v,vy:Math.sin(a)*v-140,life:1,col:cols[k%cols.length]});}
+  if(parts.length>300)parts.splice(0,parts.length-300);
+}
+function drawParts(dt){
+  for(const p of parts){p.life-=dt*0.7;p.vy+=260*dt;p.x+=p.vx*dt;p.y+=p.vy*dt;}
+  parts=parts.filter(p=>p.life>0);
+  for(const p of parts){g.globalAlpha=Math.max(0,Math.min(1,p.life));g.fillStyle=p.col;g.beginPath();g.arc(p.x,p.y,7,0,7);g.fill();}
+  g.globalAlpha=1;
+}
+function draw(t,dt){
+  drawBackground(W,H,t);
+  drawTop();
+  const G=geom(house);
+  drawHouseBox(house,G.x0,G.y0,G.cell,t,pos,{roofH:Math.min(100,G.y0-124),labels:true,sel,bumps,fixed,happy:phase==="won",
+    hot:mouse&&sel!=null&&phase==="play"?roomAt(mouse.x,mouse.y):-1});
+  drawTray(t);
+  const info=infoLine();
+  if(info){g.fillStyle="#ffe9a8";g.font="600 21px system-ui,sans-serif";centre(info,360,846);}
+  drawRules();
+  drawButton(BTN.hint,hintLabel(),save.hints<=0&&adOffer(),24);
+  drawButton(BTN.restart,"↺ Restart",false,24);
+  drawButton(BTN.mode,save.mode==="street"?"📅 Daily":"🏠 Street",false,24);
+  g.fillStyle="#9c8cc0";g.font="13px system-ui,sans-serif";centre("Made by MV2 of Munim, Inc. with AI agents",360,1272);
+  drawGuide(t);
+  drawParts(dt);
+  if(phase==="won"&&result)drawResult(t);
+  if(overlay==="tenant")drawTenant(t);
+  if(!ready){dim();g.fillStyle="#f3e9ff";g.font="600 32px system-ui,sans-serif";centre("Unlocking the front door…",W/2,H/2);}
+}
+// #demo: moves the tenants in by itself for store videos; it never saves
+function demoStep(t){
+  if(t<demoNext)return;
+  demoNext=t+0.6;
+  if(overlay==="tenant"){closeTenant();return;}
+  if(phase==="won"){if(t>=resultAt+1.5)next();return;}
+  let a=-1;for(let q=0;q<house.n;q++)if(pos[q]!==house.sol[q]){a=q;break;}
+  if(a<0)return;
+  if(sel!==a)tapTenant(a);else tapRoom(house.sol[a]);
+}
+let lastMs=performance.now();
+function frame(ms){
+  const dt=Math.min(Math.max((ms-lastMs)/1000,0),0.1);lastMs=ms;
+  const t=now();
+  if(demo)demoStep(t);
+  if(phase==="play"&&!overlay&&ready&&!document.hidden)secs+=dt;
+  draw(t,dt);
+  requestAnimationFrame(frame);
+}
+
+// ---------- #cover: store and jam covers as images (right-click, Save image as) ----------
+function renderCover(cw,ch){
+  const c=document.createElement("canvas");c.width=cw;c.height=ch;
+  const keep=g;
+  try{
+    g=c.getContext("2d");
+    drawBackground(cw,ch,1);
+    const h=houseFor("L15"),u=Math.min(cw,ch),cell=u*0.17,x0=(cw-cell*h.cols)/2,y0=ch*0.62-cell*h.rows/2;
+    drawHouseBox(h,x0,y0,cell,0.6,h.sol,{roofH:cell*0.65,happy:true});
+    const size=Math.round(u*0.09);
+    g.textAlign="center";g.font="bold "+size+"px system-ui,sans-serif";g.lineJoin="round";g.lineWidth=size*0.16;g.strokeStyle=INK;g.fillStyle="#ffd84a";
+    g.strokeText("Monster Roommates",cw/2,ch*0.13);g.fillText("Monster Roommates",cw/2,ch*0.13);
+    return c.toDataURL("image/png");
+  }finally{g=keep;}
+}
+
+// ---------- #selftest: the rules, then sixteen houses, a swap, hints, the Daily House and a friend's house through the real code ----------
+function selfTest(){
+  const t0=performance.now(),problems=selfTestLogic(),kept=JSON.stringify(save);
+  noSave=true;
+  try{
+    save=fresh();save.met=CAST.length;
+    const solve=()=>{for(let a=0;a<house.n;a++){tapTenant(a);tapRoom(house.sol[a]);}};
+    for(let L=1;L<=16;L++){
+      openHouse();draw(now(),0.016);
+      if(key!=="L"+L){problems.push("page: expected house "+L+", got "+key);break;}
+      solve();
+      if(phase!=="won"){problems.push("page: house "+L+" was not solved by its own answer");break;}
+      if(result.stars!==3)problems.push("page: house "+L+": "+result.stars+" stars for a direct move-in");
+      draw(now()+1,0.1);resultAt=-10;next();
+    }
+    if(save.level!==17||save.solved!==16||save.hints!==8)problems.push("page: after 16 houses: level "+save.level+", hints "+save.hints);
+    // a swap, then sending a tenant back to the doorstep
+    tapTenant(0);tapRoom(0);tapTenant(1);tapRoom(1);tapTenant(0);tapRoom(1);
+    if(pos[0]!==1||pos[1]!==0)problems.push("page: the swap left tenants in "+pos[0]+" and "+pos[1]);
+    tapTenant(0);tapTenant(0);
+    if(pos[0]!==-1)problems.push("page: a tenant tapped twice did not go back");
+    draw(now(),0.016);
+    const h0=save.hints;hint();
+    if(used!==1||save.hints!==h0-1||!fixed.some(Boolean))problems.push("page: the hint did not place a tenant");
+    restart();
+    if(!pos.every((p,a)=>fixed[a]?p===house.sol[a]:p<0))problems.push("page: restart did not keep only the hinted tenant");
+    for(let q=0;q<20&&phase==="play";q++){save.hints=Math.max(save.hints,1);hint();}
+    if(phase!=="won"||result.stars!==1)problems.push("page: hints did not finish the house with 1 star");
+    draw(now()+1,0.1);resultAt=-10;next();
+    save.mode="daily";openHouse();solve();
+    if(phase!=="won"||!result.first||save.daily.streak!==1||!(result.score>0))problems.push("page: the Daily House did not count");
+    draw(now()+1,0.1);resultAt=-10;next();
+    if(save.mode!=="street"||key!=="L18")problems.push("page: did not go back to the street after the Daily House");
+    save.friend="L3";save.friendMoves=9;save.mode="friend";openHouse();
+    if(key!=="L3")problems.push("page: the friend's house did not open");
+    solve();
+    if(phase!=="won"||result.friendMoves!==9||save.friend!=="")problems.push("page: the friend's house did not count");
+    draw(now()+1,0.1);resultAt=-10;next();
+    overlay="tenant";tenantIdx=9;draw(now(),0.016);overlay=null;
+    if(!/^data:image\/png/.test(renderCover(320,320)))problems.push("page: the cover did not render");
+  }catch(err){problems.push("page: "+(err&&err.stack||err));}
+  save=JSON.parse(kept);noSave=demo;parts=[];openHouse();
+  if(audio.started())problems.push("audio started without a click, touch or key");
+  return {problems,ms:Math.round(performance.now()-t0)};
+}
+
+fit();
+if(demo){save=fresh();save.level=10;save.met=CAST.length;document.body.classList.add("demo");}
+if(save.mute)audio.toggle();
+openHouse();
+if(location.hash==="#selftest"){
+  const r=selfTest(),box=document.getElementById("test");box.hidden=false;
+  box.textContent=`Monster Roommates self-test (v0.1.0): ${r.ms} ms.\n`+(r.problems.length?`${r.problems.length} problem(s):\n`+r.problems.slice(0,40).join("\n"):"No problems found.")+"\n\nClick to close.";
+  box.onclick=()=>{box.hidden=true;location.hash="";};
+  console.log("self-test:",r.problems.length,"problems",r.problems);
+}else if(coverMode){
+  const box=document.getElementById("covers");box.hidden=false;
+  box.textContent="Monster Roommates covers. Right-click each image and choose 'Save image as'.\n";
+  for(const [name,w,h] of [["square-1024",1024,1024],["portrait-720x1280",720,1280],["landscape-1280x720",1280,720]]){
+    const cap=document.createElement("div");cap.textContent="monster-roommates-"+name+".png";box.appendChild(cap);
+    const img=document.createElement("img");img.alt=name;img.src=renderCover(w,h);box.appendChild(img);
+  }
+}
+if(!ready)startRun();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
